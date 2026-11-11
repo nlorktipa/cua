@@ -109,6 +109,68 @@ pub fn hide_nested_windows_on(host: &Instance) {
     }
 }
 
+/// This process's own window on the user's desktop: its Hyprland instance, address and fullscreen mode
+/// (0 none, 1 maximized, 2 fullscreen).
+fn own_window() -> Option<(Instance, String, i64)> {
+    let host = host_instance()?;
+    let pid = std::process::id() as u64;
+    let clients = ipc_json(&host.signature, "clients").ok()?;
+    let window = clients.as_array()?.iter().find(|c| c["pid"].as_u64() == Some(pid))?;
+    let address = window["address"].as_str()?.to_string();
+    let fullscreen = window["fullscreen"].as_i64().unwrap_or(0);
+    Some((host, address, fullscreen))
+}
+
+fn dispatch(host: &Instance, lua: &str, legacy: &str) -> Result<()> {
+    let reply = if speaks_lua(&host.signature) {
+        ipc(&host.signature, &format!("/eval hl.dispatch({lua})"))?
+    } else {
+        ipc(&host.signature, &format!("/dispatch {legacy}"))?
+    };
+    if reply.trim() == "ok" { Ok(()) } else { Err(anyhow!("dispatch failed: {reply}")) }
+}
+
+/// Whether our own window is maximized; None when not running under Hyprland.
+pub fn own_window_maximized() -> Option<bool> {
+    own_window().map(|(_, _, fullscreen)| fullscreen == 1)
+}
+
+/// Toggle our own window between maximized and its normal size.
+pub fn toggle_maximize_own_window() -> Result<()> {
+    let (host, address, _) = own_window().ok_or_else(|| anyhow!("own window not found"))?;
+    dispatch(
+        &host,
+        &format!("hl.dsp.window.fullscreen({{ mode = \"maximized\", action = \"toggle\", window = \"address:{address}\" }})"),
+        &format!("focuswindow address:{address}"),
+    )?;
+    if !speaks_lua(&host.signature) {
+        dispatch(&host, "", "fullscreen 1")?;
+    }
+    Ok(())
+}
+
+/// Minimize our own window the way Omarchy does: park it on the `special:minimized`
+/// workspace, where the dock lists it and brings it back on click.
+pub fn minimize_own_window() -> Result<()> {
+    let host = host_instance().ok_or_else(|| anyhow!("not running under Hyprland"))?;
+    let (_, address, _) = own_window().ok_or_else(|| anyhow!("own window not found"))?;
+    let clients = ipc_json(&host.signature, "clients")?;
+    let workspace = clients
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["address"].as_str() == Some(address.as_str())))
+        .and_then(|c| c["workspace"]["id"].as_i64());
+    dispatch(
+        &host,
+        &format!("hl.dsp.window.move({{ workspace = \"special:minimized\", follow = false, window = \"address:{address}\" }})"),
+        &format!("movetoworkspacesilent special:minimized,address:{address}"),
+    )?;
+    // Otherwise focus stays on the hidden window, and the next window opened would join it there.
+    if let Some(ws) = workspace.filter(|&w| w >= 1) {
+        let _ = dispatch(&host, &format!("hl.dsp.focus({{ workspace = \"{ws}\" }})"), &format!("workspace {ws}"));
+    }
+    Ok(())
+}
+
 /// Lua string literal that needs no escaping.
 pub fn lua_string(s: &str) -> String {
     let mut level = 0;
