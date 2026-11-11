@@ -7,9 +7,10 @@ pub fn xdg_runtime() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", rustix::process::getuid().as_raw())))
 }
 
-/// Root of everything cua keeps at runtime.
+/// Root of everything cua keeps at runtime. `CUA_RUNTIME_DIR` gives a separate
+/// set of agents (e.g. for a demo), unseen by viewers using the default one.
 pub fn runtime_dir() -> PathBuf {
-    xdg_runtime().join("cua")
+    std::env::var_os("CUA_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| xdg_runtime().join("cua"))
 }
 
 /// One JSON file per agent; the viewer watches this directory.
