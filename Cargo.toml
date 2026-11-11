@@ -1,0 +1,24 @@
+[package]
+name = "cua"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+dirs = "7.0.0"
+eframe = "0.37.0"
+glob = "0.3.4"
+jpeg-encoder = "0.7.1"
+libc = "0.2.191"
+memmap2 = "0.9.12"
+rustix = { version = "1.1.6", features = ["fs", "mm", "process", "thread"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+signal-hook = "0.4.6"
+toml = "1.2.1"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+xkbcommon = "0.9.0"
