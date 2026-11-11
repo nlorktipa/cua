@@ -6,6 +6,12 @@
 
 Computer use for Claude Code on Linux with Hyprland: every Claude Code session gets its own virtual screen on your computer, with the same apps, files, wallpaper, bar and dock. Agents work in parallel without touching your mouse, your keyboard or each other.
 
+<p align="center">
+  <a href="assets/demo.mp4"><img src="assets/demo-poster.jpg" width="880" alt="cua demo: two Claude Code sessions each work on their own screen, one browsing Hacker News, one building a budget in LibreOffice Calc, while the user watches live and takes over"></a>
+  <br>
+  <sub>▶ 35-second demo: two Claude Code sessions, two screens, one takeover.</sub>
+</p>
+
 > **Limitation:** cua currently works only on Hyprland, because each agent's screen is a copy of your own desktop; other desktops (GNOME, KDE, sway, X11…) each need their own backend, and contributions adding them are very welcome.
 
 ## Build and run
