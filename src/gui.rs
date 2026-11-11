@@ -1,15 +1,16 @@
 //! The viewer: a Mac-style window with agents in the sidebar and the selected agent's screen live on the right.
 
-use crate::registry::{self, AgentInfo};
+use crate::registry::{self, AgentInfo, Control};
 use crate::setup::{self, Setup};
 use crate::wl::Client;
 use anyhow::anyhow;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CornerRadius, Event, FontFamily, FontId, Id, Key, Modifiers, Pos2, Rect,
     Sense, Shadow, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, ViewportCommand,
-    epaint::RectShape,
+    PointerButton, epaint::RectShape,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -294,6 +295,156 @@ fn spawn_feed(display: String, ctx: egui::Context) -> Arc<Feed> {
     feed
 }
 
+/// Input from the viewer to an agent's screen while the user has taken it over.
+/// Positions are fractions of the screen size.
+enum Input {
+    Move(f32, f32),
+    Button(u32, bool, String),
+    Scroll(i32, i32),
+    Text(String),
+    Combo(String),
+}
+
+/// The user's mouse and keyboard on one agent's screen.
+struct Remote {
+    id: String,
+    tx: Sender<Input>,
+    /// Buttons pressed on the screen and not yet released.
+    down: HashSet<u32>,
+    /// Wheel movement not yet sent as whole clicks.
+    scroll: Vec2,
+}
+
+fn spawn_remote(display: String) -> Sender<Input> {
+    let (tx, rx) = channel::<Input>();
+    std::thread::spawn(move || drive_remote(&display, rx));
+    tx
+}
+
+fn drive_remote(display: &str, rx: Receiver<Input>) {
+    let mut client: Option<Client> = None;
+    let mut held: HashSet<u32> = HashSet::new();
+    for input in rx.iter() {
+        if client.is_none() {
+            client = Client::connect(display).ok();
+        }
+        let Some(c) = client.as_mut() else { continue };
+        let (w, h) = c.size();
+        let result = match input {
+            Input::Move(x, y) => c.move_to(x as f64 * w as f64, y as f64 * h as f64),
+            Input::Button(button, pressed, mods) => {
+                let mut r = Ok(());
+                if pressed && !mods.is_empty() {
+                    r = c.hold_modifiers(&mods);
+                }
+                if pressed {
+                    held.insert(button);
+                } else {
+                    held.remove(&button);
+                }
+                r.and_then(|_| c.button(button, pressed)).and_then(|_| if pressed || mods.is_empty() { Ok(()) } else { c.hold_modifiers("") })
+            }
+            Input::Scroll(dx, dy) => c.scroll(dx, dy),
+            Input::Text(text) => c.type_text(&text),
+            Input::Combo(combo) => c.key_combo(&combo),
+        };
+        if let Err(e) = result {
+            eprintln!("cua: input to {display} failed: {e:#}");
+            client = None;
+        }
+    }
+    // The user gave control back: let go of anything still pressed.
+    if let Some(c) = client.as_mut() {
+        for button in held {
+            let _ = c.button(button, false);
+        }
+        let _ = c.hold_modifiers("");
+    }
+}
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+/// Keysym name for a key that is not sent as text.
+fn key_name(key: Key) -> Option<String> {
+    use Key::*;
+    let name = match key {
+        ArrowDown => "Down",
+        ArrowLeft => "Left",
+        ArrowRight => "Right",
+        ArrowUp => "Up",
+        Escape => "Escape",
+        Tab => "Tab",
+        Backspace => "BackSpace",
+        Enter => "Return",
+        Insert => "Insert",
+        Delete => "Delete",
+        Home => "Home",
+        End => "End",
+        PageUp => "Prior",
+        PageDown => "Next",
+        Space => "space",
+        Minus => "minus",
+        Plus => "plus",
+        Equals => "equal",
+        Comma => "comma",
+        Period => "period",
+        Slash => "slash",
+        Backslash => "backslash",
+        Semicolon => "semicolon",
+        Colon => "colon",
+        Quote => "apostrophe",
+        Backtick => "grave",
+        OpenBracket => "bracketleft",
+        CloseBracket => "bracketright",
+        _ => {
+            let n = key.name();
+            return if n.chars().count() == 1 {
+                Some(n.to_lowercase())
+            } else if n.starts_with('F') && n[1..].chars().all(|c| c.is_ascii_digit()) {
+                Some(n.to_string())
+            } else {
+                None
+            };
+        }
+    };
+    Some(name.to_string())
+}
+
+/// Keys that type no text, so they are sent even without modifiers.
+fn is_command_key(key: Key) -> bool {
+    use Key::*;
+    matches!(key, ArrowDown | ArrowLeft | ArrowRight | ArrowUp | Escape | Tab | Backspace | Enter | Insert | Delete | Home | End | PageUp | PageDown)
+        || key_name(key).is_some_and(|n| n.len() > 1 && n.starts_with('F') && n[1..].chars().all(|c| c.is_ascii_digit()))
+}
+
+fn mods_spec(m: Modifiers) -> String {
+    let mut parts = Vec::new();
+    if m.ctrl || m.command {
+        parts.push("ctrl");
+    }
+    if m.alt {
+        parts.push("alt");
+    }
+    if m.shift {
+        parts.push("shift");
+    }
+    parts.join("+")
+}
+
+/// Something the user asked for from the toolbar, a context menu or a shortcut.
+#[derive(Clone)]
+enum Action {
+    Stop(String),
+    Resume(String),
+    TakeOver(String),
+    GiveBack(String),
+    AskRemove(String),
+    Copy(String),
+    OpenFolder(String),
+}
+
 struct Slot {
     display: String,
     feed: Arc<Feed>,
@@ -329,6 +480,13 @@ struct App {
     toast: Option<Toast>,
     /// Whether the window is maximized, as Hyprland reports it.
     maximized: bool,
+    /// The selected agent's screen, while the user has taken it over.
+    remote: Option<Remote>,
+    /// Tab presses kept from egui (which would move its focus) during a takeover.
+    tabs: Vec<Modifiers>,
+    /// Agent waiting for the user to confirm its removal.
+    confirm_remove: Option<String>,
+    actions: Vec<Action>,
 }
 
 impl App {
@@ -347,6 +505,10 @@ impl App {
             focus_search: false,
             toast: None,
             maximized: false,
+            remote: None,
+            tabs: Vec::new(),
+            confirm_remove: None,
+            actions: Vec::new(),
         }
     }
 
@@ -423,8 +585,8 @@ impl App {
         self.toast = Some(Toast { text: text.into(), at: Instant::now() });
     }
 
-    fn copy_screen(&mut self, ctx: &egui::Context) {
-        let image = self.selected.as_ref().and_then(|id| self.slots.get(id)).and_then(|s| s.feed.latest.lock().unwrap().clone());
+    fn copy_screen(&mut self, ctx: &egui::Context, id: &str) {
+        let image = self.slots.get(id).and_then(|s| s.feed.latest.lock().unwrap().clone());
         match image {
             Some(image) => {
                 ctx.copy_image(Arc::unwrap_or_clone(image));
@@ -434,16 +596,182 @@ impl App {
         }
     }
 
-    fn open_folder(&mut self) {
-        let Some(cwd) = self.selected_agent().map(|a| a.cwd.clone()) else { return };
+    fn open_folder(&mut self, id: &str) {
+        let Some(cwd) = self.agents.iter().find(|a| a.id == id).map(|a| a.cwd.clone()) else { return };
         match std::process::Command::new("xdg-open").arg(&cwd).spawn() {
             Ok(_) => self.show_toast(format!("Opened {}", short_name(&cwd))),
             Err(_) => self.show_toast("Couldn't open folder"),
         }
     }
 
+    fn agent(&self, id: &str) -> Option<&AgentInfo> {
+        self.agents.iter().find(|a| a.id == id)
+    }
+
+    /// Tell an agent what the user wants, and show it right away.
+    fn set_control(&mut self, id: &str, control: Control) -> bool {
+        if let Err(e) = registry::set_control(id, control) {
+            self.show_toast(format!("Couldn't reach the agent: {e}"));
+            return false;
+        }
+        if let Some(a) = self.agents.iter_mut().find(|a| a.id == id) {
+            a.control = control;
+        }
+        true
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::Stop(id) => {
+                if self.set_control(&id, Control::Stop) {
+                    self.show_toast("Agent stopped");
+                }
+            }
+            Action::Resume(id) | Action::GiveBack(id) => {
+                let was = self.agent(&id).map(|a| a.control);
+                if self.set_control(&id, Control::Run) {
+                    self.show_toast(if was == Some(Control::Takeover) { "Agent continues" } else { "Agent resumed" });
+                }
+            }
+            Action::TakeOver(id) => {
+                if self.agent(&id).is_some_and(|a| a.status == "ready") && self.set_control(&id, Control::Takeover) {
+                    self.selected = Some(id);
+                    self.show_toast("You're in control");
+                }
+            }
+            Action::AskRemove(id) => self.confirm_remove = Some(id),
+            Action::Copy(id) => self.copy_screen(ctx, &id),
+            Action::OpenFolder(id) => self.open_folder(&id),
+        }
+    }
+
+    fn remove_agent(&mut self, id: &str) {
+        if self.set_control(id, Control::Close) {
+            let index = self.visible_agents().iter().position(|a| a.id == id);
+            self.agents.retain(|a| a.id != id);
+            self.slots.remove(id);
+            if self.selected.as_deref() == Some(id) {
+                let visible = self.visible_agents();
+                self.selected = index.and_then(|i| visible.get(i.min(visible.len().saturating_sub(1)))).map(|a| a.id.clone());
+            }
+            self.show_toast("Agent removed");
+        }
+    }
+
+    /// The selected agent, when the user has taken it over.
+    fn taken_over(&self) -> Option<&AgentInfo> {
+        self.selected_agent().filter(|a| a.control == Control::Takeover && a.status == "ready")
+    }
+
+    /// Keep an input connection to the taken-over agent's screen, and only to it.
+    fn sync_remote(&mut self) {
+        let want = self.taken_over().and_then(|a| Some((a.id.clone(), a.wayland_display.clone()?)));
+        match (&self.remote, want) {
+            (Some(r), Some((id, _))) if r.id == id => {}
+            (_, Some((id, display))) => {
+                self.remote = Some(Remote { id, tx: spawn_remote(display), down: HashSet::new(), scroll: Vec2::ZERO });
+            }
+            (_, None) => self.remote = None,
+        }
+    }
+
+    /// Send the user's mouse and keyboard to the taken-over screen drawn at `screen`.
+    fn forward_input(&mut self, ctx: &egui::Context, screen: Rect) {
+        let keyboard = ctx.memory(|m| m.focused().is_none()) && self.confirm_remove.is_none() && !self.shortcuts_open;
+        let tabs = std::mem::take(&mut self.tabs);
+        let Some(remote) = &mut self.remote else { return };
+        let events = ctx.input(|i| i.events.clone());
+        if keyboard {
+            for m in tabs {
+                let mods = mods_spec(m);
+                let _ = remote.tx.send(Input::Combo(if mods.is_empty() { "Tab".into() } else { format!("{mods}+Tab") }));
+            }
+        }
+        let to_screen = |p: Pos2| {
+            let v = (p - screen.min) / screen.size();
+            Input::Move(v.x.clamp(0.0, 1.0), v.y.clamp(0.0, 1.0))
+        };
+        let send = |input: Input| {
+            let _ = remote.tx.send(input);
+        };
+        let hovering = ctx.pointer_hover_pos().is_some_and(|p| screen.contains(p));
+        if hovering {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
+        }
+        for event in events {
+            match event {
+                Event::PointerMoved(p) if screen.contains(p) || !remote.down.is_empty() => send(to_screen(p)),
+                Event::PointerButton { pos, button, pressed, modifiers } => {
+                    let code = match button {
+                        PointerButton::Primary => BTN_LEFT,
+                        PointerButton::Secondary => BTN_RIGHT,
+                        PointerButton::Middle => BTN_MIDDLE,
+                        _ => continue,
+                    };
+                    if pressed && screen.contains(pos) {
+                        remote.down.insert(code);
+                        send(to_screen(pos));
+                        send(Input::Button(code, true, mods_spec(modifiers)));
+                    } else if !pressed && remote.down.remove(&code) {
+                        send(Input::Button(code, false, mods_spec(modifiers)));
+                    }
+                }
+                Event::MouseWheel { unit, delta, .. } if hovering => {
+                    let clicks = match unit {
+                        egui::MouseWheelUnit::Point => delta / 50.0,
+                        egui::MouseWheelUnit::Line => delta,
+                        egui::MouseWheelUnit::Page => delta * 10.0,
+                    };
+                    remote.scroll -= clicks;
+                    let (dx, dy) = (remote.scroll.x.trunc(), remote.scroll.y.trunc());
+                    if dx != 0.0 || dy != 0.0 {
+                        remote.scroll -= Vec2::new(dx, dy);
+                        send(Input::Scroll(dx as i32, dy as i32));
+                    }
+                }
+                Event::Text(text) if keyboard => send(Input::Text(text)),
+                Event::Paste(text) if keyboard => send(Input::Text(text)),
+                Event::Copy if keyboard => send(Input::Combo("ctrl+c".into())),
+                Event::Cut if keyboard => send(Input::Combo("ctrl+x".into())),
+                Event::Key { key, pressed: true, modifiers, .. } if keyboard => {
+                    if !(modifiers.ctrl || modifiers.command || modifiers.alt || is_command_key(key)) {
+                        continue; // arrives as text
+                    }
+                    let Some(name) = key_name(key) else { continue };
+                    let mods = mods_spec(modifiers);
+                    send(Input::Combo(if mods.is_empty() { name } else { format!("{mods}+{name}") }));
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context, search_focused: bool) {
+        // While the user drives an agent's screen, every key but one goes there.
+        if self.confirm_remove.is_none() && !self.shortcuts_open && !search_focused && let Some(id) = self.taken_over().map(|a| a.id.clone()) {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Period)) {
+                self.actions.push(Action::GiveBack(id));
+            }
+            return;
+        }
+        if let Some(id) = self.confirm_remove.clone() {
+            let (cancel, confirm) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Escape), i.consume_key(Modifiers::NONE, Key::Enter)));
+            if confirm {
+                self.confirm_remove = None;
+                self.remove_agent(&id);
+            } else if cancel {
+                self.confirm_remove = None;
+            }
+            return;
+        }
         let cmd = Modifiers::COMMAND;
+        let (stop, take, remove) = ctx.input_mut(|i| {
+            (
+                i.consume_key(cmd, Key::Period),
+                i.consume_key(cmd, Key::T),
+                !search_focused && (i.consume_key(cmd, Key::Backspace) || i.consume_key(cmd, Key::Delete)),
+            )
+        });
         let (find, sidebar, help, open, close, esc, up, down, copy, numbers) = ctx.input_mut(|i| {
             let numbers: Vec<bool> = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9]
                 .into_iter()
@@ -488,11 +816,23 @@ impl App {
         if sidebar {
             self.sidebar_open = !self.sidebar_open;
         }
-        if open {
-            self.open_folder();
-        }
-        if copy {
-            self.copy_screen(ctx);
+        if let Some(agent) = self.selected_agent() {
+            let id = agent.id.clone();
+            if stop {
+                self.actions.push(if agent.control == Control::Run { Action::Stop(id.clone()) } else { Action::Resume(id.clone()) });
+            }
+            if take {
+                self.actions.push(Action::TakeOver(id.clone()));
+            }
+            if remove {
+                self.actions.push(Action::AskRemove(id.clone()));
+            }
+            if open {
+                self.actions.push(Action::OpenFolder(id.clone()));
+            }
+            if copy {
+                self.actions.push(Action::Copy(id));
+            }
         }
         let visible = self.visible_agents();
         if let Some(n) = numbers.iter().position(|&b| b)
@@ -573,9 +913,11 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut list_ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
                 for agent in &visible {
-                    if self.row(ui, pal, agent) {
+                    let (clicked, action) = self.row(ui, pal, agent);
+                    if clicked {
                         self.selected = Some(agent.id.clone());
                     }
+                    self.actions.extend(action);
                 }
                 if visible.is_empty() {
                     ui.add_space(24.0);
@@ -617,14 +959,15 @@ impl App {
         search_focused
     }
 
-    /// One agent in the sidebar. Returns true when clicked.
-    fn row(&self, ui: &mut Ui, pal: &Palette, agent: &AgentInfo) -> bool {
+    /// One agent in the sidebar. Returns whether it was clicked, and what its context menu asked for.
+    fn row(&self, ui: &mut Ui, pal: &Palette, agent: &AgentInfo) -> (bool, Option<Action>) {
         let width = ui.available_width();
         let (outer, response) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
         let rect = outer.shrink2(Vec2::new(10.0, 0.0));
         let selected = self.selected.as_deref() == Some(agent.id.as_str());
-        let ctx = ui.ctx();
-        let hover = ctx.animate_bool_with_time(Id::unique(("row-hover", &agent.id)), response.hovered(), 0.12);
+        let ctx = ui.ctx().clone();
+        let menu_open = response.context_menu_opened();
+        let hover = ctx.animate_bool_with_time(Id::unique(("row-hover", &agent.id)), response.hovered() || menu_open, 0.12);
         let sel = ctx.animate_bool_with_time(Id::unique(("row-sel", &agent.id)), selected, 0.16);
         let p = ui.painter();
         if hover > 0.0 {
@@ -632,6 +975,13 @@ impl App {
         }
         if sel > 0.0 {
             p.rect_filled(rect, 8.0, pal.active.gamma_multiply(sel));
+        }
+        if menu_open {
+            // The row a context menu belongs to gets an accent outline, as in Finder.
+            p.rect_stroke(rect.shrink(1.0), 7.0, Stroke::new(2.0, pal.accent), StrokeKind::Inside);
+        }
+        if agent.control == Control::Takeover {
+            p.rect_stroke(rect.shrink(1.0), 7.0, Stroke::new(1.0, pal.accent.gamma_multiply(0.5)), StrokeKind::Inside);
         }
 
         // Thumbnail.
@@ -656,7 +1006,31 @@ impl App {
         p.circle_filled(Pos2::new(x + 3.0, sub_y), 3.0, color);
         text_elided(p, Pos2::new(x + 11.0, sub_y), Align2::LEFT_CENTER, &format!("{label} · {}", agent.name), regular(11.5), pal.secondary, right - x - 11.0);
 
-        response.clicked()
+        let mut action = None;
+        response.context_menu(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
+            let id = agent.id.clone();
+            let ready = agent.status == "ready";
+            let pick = |a: &mut Option<Action>, clicked: bool, act: Action| {
+                if clicked {
+                    *a = Some(act);
+                }
+            };
+            match agent.control {
+                Control::Takeover => pick(&mut action, menu_item(ui, pal, "Give Back Control", "Ctrl .", false, true), Action::GiveBack(id.clone())),
+                Control::Stop => pick(&mut action, menu_item(ui, pal, "Resume Agent", "Ctrl .", false, true), Action::Resume(id.clone())),
+                _ => pick(&mut action, menu_item(ui, pal, "Stop Agent", "Ctrl .", false, true), Action::Stop(id.clone())),
+            }
+            if agent.control != Control::Takeover {
+                pick(&mut action, menu_item(ui, pal, "Take Over Screen", "Ctrl T", false, ready), Action::TakeOver(id.clone()));
+            }
+            menu_separator(ui, pal);
+            pick(&mut action, menu_item(ui, pal, "Copy Screenshot", "", false, self.slots.get(&id).is_some_and(|s| s.texture.is_some())), Action::Copy(id.clone()));
+            pick(&mut action, menu_item(ui, pal, "Open Folder", "", false, true), Action::OpenFolder(id.clone()));
+            menu_separator(ui, pal);
+            pick(&mut action, menu_item(ui, pal, "Remove from Sidebar…", "Ctrl ⌫", true, true), Action::AskRemove(id));
+        });
+        (response.clicked(), action)
     }
 
     /// Draw an agent's latest frame (or a placeholder) into `rect`.
@@ -709,7 +1083,7 @@ impl App {
             return;
         };
 
-        // Toolbar, right side: status badge and actions.
+        // Toolbar, right side: control buttons, status badge and actions.
         let cy = toolbar.center().y;
         let divider_x = toolbar.max.x - CONTROLS_W + 8.0;
         p.line_segment([Pos2::new(divider_x, cy - 9.0), Pos2::new(divider_x, cy + 9.0)], Stroke::new(1.0, pal.hairline));
@@ -717,20 +1091,57 @@ impl App {
         let folder = Rect::from_center_size(Pos2::new(right - 14.0, cy), Vec2::splat(28.0));
         right = folder.min.x - 4.0;
         let copy = Rect::from_center_size(Pos2::new(right - 14.0, cy), Vec2::splat(28.0));
-        right = copy.min.x - 12.0;
+        right = copy.min.x - 10.0;
+        p.line_segment([Pos2::new(right, cy - 9.0), Pos2::new(right, cy + 9.0)], Stroke::new(1.0, pal.hairline));
+        right -= 10.0;
 
+        let id = agent.id.clone();
+        let ready = agent.status == "ready";
+        let buttons: Vec<(&str, Glyph, bool, &str, Action)> = match agent.control {
+            Control::Takeover => vec![("Give Back", Glyph::Play, true, "Hand the screen back to the agent   Ctrl .", Action::GiveBack(id.clone()))],
+            Control::Stop => {
+                let mut b = vec![("Resume", Glyph::Play, true, "Let the agent continue   Ctrl .", Action::Resume(id.clone()))];
+                if ready {
+                    b.insert(0, ("Take Over", Glyph::Pointer, false, "Use this screen yourself   Ctrl T", Action::TakeOver(id.clone())));
+                }
+                b
+            }
+            _ => {
+                let mut b = vec![("Stop", Glyph::Stop, false, "Stop the agent from using the screen   Ctrl .", Action::Stop(id.clone()))];
+                if ready {
+                    b.insert(0, ("Take Over", Glyph::Pointer, false, "Stop the agent and use its screen yourself   Ctrl T", Action::TakeOver(id.clone())));
+                }
+                b
+            }
+        };
+        for (label, glyph, primary, tip, action) in buttons.into_iter().rev() {
+            let w = pill_width(&p, label);
+            let r = Rect::from_min_max(Pos2::new(right - w, cy - 13.0), Pos2::new(right, cy + 13.0));
+            if pill_button(ui, pal, r, label, glyph, primary, tip).clicked() {
+                self.actions.push(action);
+            }
+            right = r.min.x - 8.0;
+        }
+        right -= 4.0;
+
+        // The badge goes first when the title would get too short.
         let (color, label) = status(&agent, pal);
         let badge_text = p.layout_no_wrap(label.to_string(), semibold(11.0), color);
         let badge = Rect::from_min_size(
             Pos2::new(right - badge_text.size().x - 26.0, cy - 11.0),
             Vec2::new(badge_text.size().x + 26.0, 22.0),
         );
-        p.rect_filled(badge, 11.0, color.gamma_multiply(if pal.dark { 0.18 } else { 0.13 }));
-        p.circle_filled(Pos2::new(badge.min.x + 11.0, cy), 3.0, color);
-        p.galley(Pos2::new(badge.min.x + 18.0, cy - badge_text.size().y / 2.0), badge_text, color);
+        let title_right = if badge.min.x - title_x > 180.0 {
+            p.rect_filled(badge, 11.0, color.gamma_multiply(if pal.dark { 0.18 } else { 0.13 }));
+            p.circle_filled(Pos2::new(badge.min.x + 11.0, cy), 3.0, color);
+            p.galley(Pos2::new(badge.min.x + 18.0, cy - badge_text.size().y / 2.0), badge_text, color);
+            badge.min.x
+        } else {
+            right
+        };
 
         // Toolbar, left side: what the agent is doing, and where.
-        let text_w = (badge.min.x - title_x - 16.0).max(0.0);
+        let text_w = (title_right - title_x - 16.0).max(0.0);
         text_elided(&p, Pos2::new(title_x, cy - 8.0), Align2::LEFT_CENTER, &row_title(&agent), semibold(13.5), pal.text, text_w);
         text_elided(&p, Pos2::new(title_x, cy + 9.0), Align2::LEFT_CENTER, &tilde(&agent.cwd), regular(11.0), pal.secondary, text_w);
 
@@ -743,10 +1154,10 @@ impl App {
         })
         .clicked()
         {
-            self.copy_screen(ui.ctx());
+            self.actions.push(Action::Copy(id.clone()));
         }
         if icon_button(ui, pal, folder, "folder", "Open Folder   Ctrl O", |p, c, col| icon_folder(p, c, col)).clicked() {
-            self.open_folder();
+            self.actions.push(Action::OpenFolder(id.clone()));
         }
 
         // Screen, letterboxed to keep its aspect ratio, floating on the stage.
@@ -770,6 +1181,19 @@ impl App {
         self.paint_screen(&p, pal, &agent, screen, 10.0, Some(15.0));
         p.rect_stroke(screen, 10.0, Stroke::new(0.5, pal.hairline), StrokeKind::Outside);
 
+        let control = agent.control;
+        let taking = ui.ctx().animate_bool_with_time(Id::unique(("takeover", &id)), control == Control::Takeover, 0.2);
+        if taking > 0.0 {
+            p.rect_stroke(screen.expand(2.0), 12.0, Stroke::new(2.5, pal.accent.gamma_multiply(taking)), StrokeKind::Outside);
+        }
+        if control == Control::Takeover && ready {
+            self.forward_input(ui.ctx(), screen);
+        }
+        let stopped = ui.ctx().animate_bool_with_time(Id::unique(("stopped", &id)), control == Control::Stop, 0.2);
+        if stopped > 0.0 {
+            self.stopped_overlay(ui, pal, screen, &agent, stopped);
+        }
+
         // Where the agent last pointed, as a fading ring.
         if let (Some((x, y)), Some(at)) = (agent.last_point, agent.last_action_at) {
             let age = registry::now_ms().saturating_sub(at) as f32 / 1000.0;
@@ -785,20 +1209,80 @@ impl App {
             }
         }
 
-        // Caption under the screen: its resolution.
+        // Caption under the screen: who is in control, else its resolution.
+        let caption_y = screen.max.y + 10.0 + caption_h / 2.0;
+        if control == Control::Takeover {
+            let text = p.layout_no_wrap("You control this screen; the agent waits.   Give back with".into(), regular(11.5), pal.secondary);
+            let keys = ["Ctrl", "."];
+            let keys_w: f32 = keys.iter().map(|k| (p.layout_no_wrap(k.to_string(), regular(10.5), pal.secondary).size().x + 10.0).max(18.0) + 3.0).sum::<f32>() - 3.0;
+            let total = 14.0 + text.size().x + 8.0 + keys_w;
+            if total < screen.width() {
+                let x = screen.center().x - total / 2.0;
+                p.circle_filled(Pos2::new(x + 4.0, caption_y), 4.0, pal.accent);
+                p.galley(Pos2::new(x + 14.0, caption_y - text.size().y / 2.0), text.clone(), pal.secondary);
+                kbd(&p, Pos2::new(x + total, caption_y), &keys, pal);
+            }
+            return;
+        }
         if agent.width == 0 {
             return;
         }
         let caption = format!("{} × {}", agent.width, agent.height);
         text_elided(
             &p,
-            Pos2::new(screen.center().x, screen.max.y + 10.0 + caption_h / 2.0),
+            Pos2::new(screen.center().x, caption_y),
             Align2::CENTER_CENTER,
             &caption,
             regular(11.0),
             pal.tertiary,
             screen.width(),
         );
+    }
+
+    /// Dims a stopped agent's screen and offers the way back.
+    fn stopped_overlay(&mut self, ui: &mut Ui, pal: &Palette, screen: Rect, agent: &AgentInfo, a: f32) {
+        let p = ui.painter().clone();
+        p.rect_filled(screen, 10.0, rgba(0, 0, 0, 0.38 * a));
+        if a < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let ready = agent.status == "ready";
+        let card_w = 300.0;
+        let card_h = 158.0;
+        if screen.width() < card_w + 24.0 || screen.height() < card_h + 24.0 {
+            return;
+        }
+        let card = Rect::from_center_size(screen.center() + Vec2::new(0.0, 6.0 * (1.0 - a)), Vec2::new(card_w, card_h));
+        p.add(Shadow { offset: [0, 10], blur: 36, spread: 0, color: rgba(0, 0, 0, 0.3 * a) }.as_shape(card, 14));
+        p.rect_filled(card, 14.0, pal.elevated.gamma_multiply(a));
+        p.rect_stroke(card, 14.0, Stroke::new(0.5, pal.hairline.gamma_multiply(a)), StrokeKind::Inside);
+        let c = Pos2::new(card.center().x, card.min.y + 34.0);
+        p.circle_filled(c, 16.0, pal.orange.gamma_multiply(0.16 * a));
+        for dx in [-3.5, 3.5] {
+            p.rect_filled(Rect::from_center_size(c + Vec2::new(dx, 0.0), Vec2::new(3.5, 12.0)), 1.2, pal.orange.gamma_multiply(a));
+        }
+        p.text(Pos2::new(card.center().x, card.min.y + 66.0), Align2::CENTER_CENTER, "Agent Stopped", semibold(14.0), pal.text.gamma_multiply(a));
+        p.text(Pos2::new(card.center().x, card.min.y + 86.0), Align2::CENTER_CENTER, "Claude Code waits until you resume it.", regular(12.0), pal.secondary.gamma_multiply(a));
+        if a < 0.99 {
+            return;
+        }
+        let by = card.max.y - 30.0;
+        let resume_w = pill_width(&p, "Resume");
+        let take_w = pill_width(&p, "Take Over");
+        let total = if ready { resume_w + 8.0 + take_w } else { resume_w };
+        let mut x = card.center().x - total / 2.0;
+        let id = agent.id.clone();
+        if ready {
+            let r = Rect::from_min_size(Pos2::new(x, by - 13.0), Vec2::new(take_w, 26.0));
+            if pill_button(ui, pal, r, "Take Over", Glyph::Pointer, false, "Use this screen yourself   Ctrl T").clicked() {
+                self.actions.push(Action::TakeOver(id.clone()));
+            }
+            x = r.max.x + 8.0;
+        }
+        let r = Rect::from_min_size(Pos2::new(x, by - 13.0), Vec2::new(resume_w, 26.0));
+        if pill_button(ui, pal, r, "Resume", Glyph::Play, true, "Let the agent continue   Ctrl .").clicked() {
+            self.actions.push(Action::Resume(id));
+        }
     }
 
     fn empty_state(&self, p: &egui::Painter, pal: &Palette, rect: Rect) {
@@ -911,6 +1395,64 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Asks before removing an agent, since its screen and apps close.
+    fn remove_sheet(&mut self, ctx: &egui::Context, pal: &Palette, screen: Rect) {
+        let open = self.confirm_remove.is_some();
+        let anim = ctx.animate_bool_with_time(Id::unique("remove-sheet"), open, 0.18);
+        if anim <= 0.0 {
+            return;
+        }
+        let title = self
+            .confirm_remove
+            .as_deref()
+            .and_then(|id| self.agent(id))
+            .map(row_title)
+            .unwrap_or_default();
+        let a = ease_out(anim);
+        egui::Area::new(Id::unique("remove-area")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let backdrop = ui.allocate_rect(screen, Sense::click());
+            let p = ui.painter().clone();
+            p.rect_filled(screen, 0.0, rgba(0, 0, 0, if pal.dark { 0.45 } else { 0.22 } * a));
+            let w = 340.0;
+            let mut body = egui::text::LayoutJob::simple(
+                "Its screen and the apps on it close, and Claude Code is told to stop using the computer.".into(),
+                regular(12.5),
+                pal.secondary.gamma_multiply(a),
+                w - 48.0,
+            );
+            body.halign = egui::Align::Center;
+            let body = p.layout_job(body);
+            let h = 70.0 + 24.0 + body.size().y + 24.0 + 28.0 + 20.0;
+            let panel = Rect::from_center_size(screen.center() + Vec2::new(0.0, 10.0 * (1.0 - a)), Vec2::new(w, h) * (0.97 + 0.03 * a));
+            p.add(Shadow { offset: [0, 18], blur: 60, spread: 0, color: rgba(0, 0, 0, if pal.dark { 0.6 } else { 0.22 } * a) }.as_shape(panel, 14));
+            p.rect_filled(panel, 14.0, pal.elevated.gamma_multiply(a));
+            p.rect_stroke(panel, 14.0, Stroke::new(0.5, pal.hairline.gamma_multiply(a)), StrokeKind::Inside);
+            let c = Pos2::new(panel.center().x, panel.min.y + 40.0);
+            p.circle_filled(c, 20.0, pal.red.gamma_multiply(0.14 * a));
+            icon_trash(&p, c, pal.red.gamma_multiply(a));
+            let mut y = panel.min.y + 80.0;
+            text_elided(&p, Pos2::new(panel.center().x, y), Align2::CENTER_CENTER, &format!("Remove “{title}”?"), semibold(14.0), pal.text.gamma_multiply(a), w - 40.0);
+            y += 16.0;
+            p.galley(Pos2::new(panel.center().x, y), body.clone(), pal.secondary);
+            let by = panel.max.y - 20.0 - 14.0;
+            let bw = (w - 40.0 - 10.0) / 2.0;
+            let cancel = Rect::from_min_size(Pos2::new(panel.min.x + 20.0, by - 14.0), Vec2::new(bw, 28.0));
+            let remove = cancel.translate(Vec2::new(bw + 10.0, 0.0));
+            if open && a > 0.98 {
+                if sheet_button(ui, pal, cancel, "Cancel", false).clicked() {
+                    self.confirm_remove = None;
+                } else if sheet_button(ui, pal, remove, "Remove", true).clicked()
+                    && let Some(id) = self.confirm_remove.take()
+                {
+                    self.remove_agent(&id);
+                }
+            }
+            if backdrop.clicked() && !panel.contains(backdrop.interact_pointer_pos().unwrap_or(panel.center())) {
+                self.confirm_remove = None;
+            }
+        });
+    }
+
     fn shortcuts_sheet(&mut self, ctx: &egui::Context, pal: &Palette, screen: Rect) {
         let anim = ctx.animate_bool_with_time(Id::unique("sheet"), self.shortcuts_open, 0.18);
         if anim <= 0.0 {
@@ -928,6 +1470,10 @@ impl App {
                 ("Jump to agent", &["Ctrl", "1–9"]),
                 ("Copy screenshot", &["Ctrl", "C"]),
                 ("Open agent's folder", &["Ctrl", "O"]),
+                ("Stop / resume agent", &["Ctrl", "."]),
+                ("Take over screen", &["Ctrl", "T"]),
+                ("Give back control", &["Ctrl", "."]),
+                ("Remove agent", &["Ctrl", "⌫"]),
                 ("Show or hide sidebar", &["Ctrl", "B"]),
                 ("Keyboard shortcuts", &["Ctrl", "/"]),
                 ("Close window", &["Ctrl", "W"]),
@@ -958,6 +1504,23 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // egui moves focus between its widgets on Tab; during a takeover Tab belongs to the agent's screen.
+        let driving = self.remote.is_some() && self.confirm_remove.is_none() && !self.shortcuts_open && ctx.memory(|m| m.focused().is_none());
+        if !driving {
+            return;
+        }
+        raw.events.retain(|e| match e {
+            Event::Key { key: Key::Tab, pressed, modifiers, .. } => {
+                if *pressed {
+                    self.tabs.push(*modifiers);
+                }
+                false
+            }
+            _ => true,
+        });
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.refresh(&ctx);
@@ -967,6 +1530,7 @@ impl eframe::App for App {
         ui.painter().rect_filled(window, 0.0, pal.content);
 
         let search_focused = ctx.memory(|m| m.has_focus(Id::unique("search")));
+        self.sync_remote();
         self.handle_keys(&ctx, search_focused);
 
         let target = if self.sidebar_open { SIDEBAR_W.min(window.width() * 0.42) } else { 0.0 };
@@ -1010,6 +1574,11 @@ impl eframe::App for App {
 
         self.toast(&ctx, &pal, content);
         self.shortcuts_sheet(&ctx, &pal, window);
+        self.remove_sheet(&ctx, &pal, window);
+
+        for action in std::mem::take(&mut self.actions) {
+            self.apply(&ctx, action);
+        }
 
         // Keep agent list and "x seconds ago" labels fresh.
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -1088,6 +1657,135 @@ fn icon_button(ui: &mut Ui, pal: &Palette, rect: Rect, id: &str, tooltip: &str, 
     r.on_hover_text(tooltip)
 }
 
+#[derive(Clone, Copy)]
+enum Glyph {
+    Stop,
+    Play,
+    Pointer,
+}
+
+fn draw_glyph(p: &egui::Painter, c: Pos2, glyph: Glyph, col: Color32) {
+    match glyph {
+        Glyph::Stop => {
+            p.rect_filled(Rect::from_center_size(c, Vec2::splat(9.0)), 2.0, col);
+        }
+        Glyph::Play => {
+            p.add(Shape::convex_polygon(
+                vec![c + Vec2::new(-3.5, -5.0), c + Vec2::new(5.0, 0.0), c + Vec2::new(-3.5, 5.0)],
+                col,
+                Stroke::NONE,
+            ));
+        }
+        Glyph::Pointer => {
+            let o = c + Vec2::new(-4.0, -6.5);
+            let pts = vec![
+                o,
+                o + Vec2::new(0.0, 11.5),
+                o + Vec2::new(3.0, 8.8),
+                o + Vec2::new(5.0, 13.0),
+                o + Vec2::new(7.0, 12.0),
+                o + Vec2::new(5.0, 7.9),
+                o + Vec2::new(9.0, 7.9),
+            ];
+            p.add(Shape::closed_line(pts, Stroke::new(1.3, col)));
+        }
+    }
+}
+
+fn pill_width(p: &egui::Painter, label: &str) -> f32 {
+    p.layout_no_wrap(label.to_string(), semibold(12.0), Color32::WHITE).size().x + 12.0 + 14.0 + 6.0 + 12.0
+}
+
+/// A labeled toolbar button; `primary` ones are filled with the accent color.
+fn pill_button(ui: &mut Ui, pal: &Palette, rect: Rect, label: &str, glyph: Glyph, primary: bool, tooltip: &str) -> egui::Response {
+    let r = ui.interact(rect, Id::unique(("pill", label, rect.min.x as i32, rect.min.y as i32)), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(r.id.with("hover"), r.hovered(), 0.12);
+    let pressed = r.is_pointer_button_down_on();
+    let p = ui.painter();
+    let (fill, fg) = if primary {
+        let base = pal.accent;
+        let fill = if pressed { base.gamma_multiply(0.82) } else { lerp_color(base, Color32::WHITE, 0.1 * hover) };
+        (fill, Color32::WHITE)
+    } else {
+        let fill = if pressed { pal.active } else { lerp_color(pal.field, pal.active, hover) };
+        (fill, pal.text)
+    };
+    p.rect_filled(rect, 7.0, fill);
+    if !primary {
+        p.rect_stroke(rect, 7.0, Stroke::new(0.5, pal.hairline), StrokeKind::Inside);
+    }
+    draw_glyph(p, Pos2::new(rect.min.x + 12.0 + 7.0, rect.center().y), glyph, fg);
+    p.text(Pos2::new(rect.min.x + 12.0 + 14.0 + 6.0, rect.center().y), Align2::LEFT_CENTER, label, semibold(12.0), fg);
+    r.on_hover_text(tooltip)
+}
+
+/// A wide button at the bottom of a sheet; `destructive` ones are red.
+fn sheet_button(ui: &mut Ui, pal: &Palette, rect: Rect, label: &str, destructive: bool) -> egui::Response {
+    let r = ui.interact(rect, Id::unique(("sheet-button", label)), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(r.id.with("hover"), r.hovered(), 0.12);
+    let p = ui.painter();
+    let (fill, fg) = if destructive {
+        (if r.is_pointer_button_down_on() { pal.red.gamma_multiply(0.82) } else { lerp_color(pal.red, Color32::WHITE, 0.1 * hover) }, Color32::WHITE)
+    } else {
+        (if r.is_pointer_button_down_on() { pal.active } else { lerp_color(pal.field, pal.active, hover) }, pal.text)
+    };
+    p.rect_filled(rect, 7.0, fill);
+    p.text(rect.center(), Align2::CENTER_CENTER, label, semibold(13.0), fg);
+    if destructive {
+        p.text(rect.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, "↵", regular(12.0), fg.gamma_multiply(0.7));
+    } else {
+        p.text(rect.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, "esc", regular(10.5), pal.tertiary);
+    }
+    r
+}
+
+const MENU_W: f32 = 232.0;
+
+/// One entry in a context menu: highlighted in the accent color on hover, as on a Mac.
+fn menu_item(ui: &mut Ui, pal: &Palette, label: &str, shortcut: &str, destructive: bool, enabled: bool) -> bool {
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(MENU_W, 24.0), if enabled { Sense::click() } else { Sense::hover() });
+    let hot = enabled && r.hovered();
+    let p = ui.painter();
+    if hot {
+        p.rect_filled(rect, 5.0, if destructive { pal.red } else { pal.accent });
+    }
+    let fg = match (enabled, hot, destructive) {
+        (false, _, _) => pal.tertiary,
+        (_, true, _) => Color32::WHITE,
+        (_, _, true) => pal.red,
+        _ => pal.text,
+    };
+    p.text(rect.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, regular(13.0), fg);
+    if !shortcut.is_empty() {
+        let col = if hot { Color32::WHITE.gamma_multiply(0.75) } else { pal.tertiary };
+        p.text(rect.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, shortcut, regular(12.0), col);
+    }
+    let clicked = enabled && r.clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
+fn menu_separator(ui: &mut Ui, pal: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(MENU_W, 9.0), Sense::hover());
+    ui.painter().line_segment([Pos2::new(rect.min.x + 10.0, rect.center().y), Pos2::new(rect.max.x - 10.0, rect.center().y)], Stroke::new(1.0, pal.hairline));
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), mix(a.a(), b.a()))
+}
+
+fn icon_trash(p: &egui::Painter, c: Pos2, color: Color32) {
+    let s = Stroke::new(1.5, color);
+    p.line_segment([c + Vec2::new(-7.0, -5.0), c + Vec2::new(7.0, -5.0)], s);
+    p.line_segment([c + Vec2::new(-2.5, -7.5), c + Vec2::new(2.5, -7.5)], s);
+    p.add(Shape::line(vec![c + Vec2::new(-5.5, -5.0), c + Vec2::new(-4.5, 7.5), c + Vec2::new(4.5, 7.5), c + Vec2::new(5.5, -5.0)], s));
+    p.line_segment([c + Vec2::new(0.0, -2.0), c + Vec2::new(0.0, 4.5)], Stroke::new(1.2, color));
+}
+
 fn icon_search(p: &egui::Painter, c: Pos2, color: Color32) {
     let ring = c + Vec2::new(-1.0, -1.0);
     p.circle_stroke(ring, 4.2, Stroke::new(1.4, color));
@@ -1154,6 +1852,11 @@ fn short_name(path: &str) -> String {
 }
 
 fn status(agent: &AgentInfo, pal: &Palette) -> (Color32, &'static str) {
+    match agent.control {
+        Control::Takeover => return (pal.accent, "You're in Control"),
+        Control::Stop => return (pal.orange, "Stopped"),
+        _ => {}
+    }
     match agent.status.as_str() {
         "ready" => {
             let recent = agent.last_action_at.is_some_and(|t| registry::now_ms().saturating_sub(t) < 15_000);

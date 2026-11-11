@@ -3,7 +3,7 @@
 
 use crate::config::Config;
 use crate::display::Display;
-use crate::registry::{self, AgentInfo};
+use crate::registry::{self, AgentInfo, Control};
 use crate::wl::{self, Client};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -29,7 +29,20 @@ browser profile, so they are logged in to the same sites; changes you make there
 (e.g. some file managers) may open their window there instead; prefer apps that are not running, or pass \
 options for a separate instance.\n\
 Call `set_task` first with a short description of what you are doing (shown to the user in the cua app's \
-sidebar), and again whenever your goal changes.";
+sidebar), and again whenever your goal changes.\n\
+The user can stop you or take over your screen from the cua app. If they stop you, a tool says so: do not retry, \
+end your turn and wait for the user. If they take over, your tool call waits until they give the screen back, then \
+returns the current screen so you can continue.";
+
+const STOPPED: &str = "The user stopped you from using the computer (in the cua app). Do not retry and do not \
+work around it: end your turn now and wait for the user's instructions. Once they resume you there, your tools work again.";
+const HANDED_BACK: &str = "The user took over your screen while this action was waiting, and has now given control \
+back to you. The action was NOT performed, and the user may have changed things. This is the screen now: continue \
+your task from here.";
+const CLOSED: &str = "The user stopped you and closed your screen (in the cua app). Do not retry: end your turn now \
+and wait for the user's instructions. If they later ask you to use the computer again, you will get a fresh screen.";
+const RESUMED: &str = "Note: the user stopped you or controlled your screen since your last action, so it may \
+have changed. Look at the screenshot before you continue.";
 
 pub fn run() -> Result<()> {
     let cfg = crate::config::load();
@@ -67,6 +80,10 @@ pub fn run() -> Result<()> {
             Ok(None) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => server.tick(),
         }
+        for reply in server.release_held() {
+            writeln!(stdout, "{reply}")?;
+            stdout.flush()?;
+        }
     }
     server.shutdown();
     Ok(())
@@ -82,6 +99,12 @@ struct Server {
     cfg: Config,
     info: AgentInfo,
     agent: Option<Agent>,
+    /// The user stopped or took over the agent since its last action.
+    interrupted: bool,
+    /// The user removed the agent; it stays off the list until its next tool call.
+    closed: bool,
+    /// Tool calls held while the user has taken over the screen: (request id, params).
+    held: Vec<(Value, Value)>,
 }
 
 impl Server {
@@ -106,7 +129,7 @@ impl Server {
             started_at: registry::now_ms() / 1000,
             ..Default::default()
         };
-        Server { cfg, info, agent: None }
+        Server { cfg, info, agent: None, interrupted: false, closed: false, held: Vec::new() }
     }
 
     fn handle_line(&mut self, line: &str) -> Option<String> {
@@ -131,7 +154,19 @@ impl Server {
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
+        if method == "notifications/cancelled" {
+            let request = params.get("requestId");
+            self.held.retain(|(id, _)| Some(id) != request);
+            return None;
+        }
         let id = id?; // notifications get no reply
+        let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
+        if method == "tools/call" && tool != "set_task" && registry::control(&self.info.id) == Control::Takeover {
+            // Answered once the user gives the screen back, so the agent's turn goes on.
+            self.interrupted = true;
+            self.held.push((id, params));
+            return None;
+        }
         let result = match method {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
@@ -171,10 +206,73 @@ impl Server {
     fn call_tool(&mut self, params: &Value) -> Value {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        match self.run_tool(name, &args) {
-            Ok(content) => json!({ "content": content }),
-            Err(e) => json!({ "content": [{ "type": "text", "text": format!("Error: {e:#}") }], "isError": true }),
+        let gate = if name == "set_task" { Ok(None) } else { self.gate() };
+        let result = gate.and_then(|note| {
+            let mut content = self.run_tool(name, &args)?;
+            if let Some(note) = note {
+                content.insert(0, json!({"type": "text", "text": note}));
+            }
+            Ok(content)
+        });
+        tool_result(result)
+    }
+
+    /// Replies to held tool calls, once the user no longer has the screen.
+    fn release_held(&mut self) -> Vec<Value> {
+        if self.held.is_empty() || registry::control(&self.info.id) == Control::Takeover {
+            return Vec::new();
         }
+        std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|(id, _)| {
+                // Stopped or removed instead: the agent hears that. Given back: it sees the screen and goes on.
+                let result = self.gate().and_then(|_| {
+                    let mut content = vec![json!({"type": "text", "text": HANDED_BACK})];
+                    content.extend(screenshot(&mut self.agent()?.client, None)?);
+                    Ok(content)
+                });
+                json!({"jsonrpc": "2.0", "id": id, "result": tool_result(result)})
+            })
+            .collect()
+    }
+
+    /// Whether the user lets the agent act. Ok carries a note to show the agent after an interruption.
+    fn gate(&mut self) -> Result<Option<&'static str>> {
+        match registry::control(&self.info.id) {
+            Control::Run => Ok(std::mem::take(&mut self.interrupted).then_some(RESUMED)),
+            Control::Stop => {
+                self.interrupted = true;
+                bail!(STOPPED)
+            }
+            Control::Takeover => {
+                self.interrupted = true;
+                bail!("The user has taken over your screen.")
+            }
+            Control::Close => {
+                // Tell the agent once; a later call (after the user says so) starts a fresh screen.
+                self.close_screen();
+                let _ = registry::set_control(&self.info.id, Control::Run);
+                self.closed = false;
+                self.interrupted = false;
+                bail!(CLOSED)
+            }
+        }
+    }
+
+    /// Stop the screen and leave the list, as the user asked by removing the agent.
+    fn close_screen(&mut self) {
+        if let Some(mut agent) = self.agent.take() {
+            agent.display.stop();
+        }
+        registry::unlist(&self.info.id);
+        self.closed = true;
+        self.info.status = "starting".into();
+        self.info.error = None;
+        self.info.wayland_display = None;
+        self.info.task = None;
+        self.info.last_action = None;
+        self.info.last_action_at = None;
+        self.info.last_point = None;
     }
 
     /// The agent's screen, started on first use and restarted if it died.
@@ -223,7 +321,9 @@ impl Server {
             let text = args.get("task").and_then(Value::as_str).unwrap_or("").trim();
             let text: String = text.chars().take(120).collect();
             self.info.task = (!text.is_empty()).then(|| text.clone());
-            let _ = registry::write(&self.info);
+            if !self.closed {
+                let _ = registry::write(&self.info);
+            }
             return Ok(vec![json!({"type": "text", "text": format!("Task set: {text}")})]);
         }
         let want_shot = args.get("screenshot").and_then(Value::as_bool).unwrap_or(true);
@@ -399,6 +499,12 @@ impl Server {
 
     /// Runs about once a second while idle.
     fn tick(&mut self) {
+        match registry::control(&self.info.id) {
+            Control::Run => {}
+            Control::Stop | Control::Takeover => self.interrupted = true,
+            Control::Close if !self.closed => self.close_screen(),
+            Control::Close => {}
+        }
         let Some(agent) = &mut self.agent else { return };
         if agent.last_wake.elapsed() > Duration::from_secs(20) {
             agent.last_wake = Instant::now();
@@ -418,6 +524,13 @@ impl Server {
         if let Some(mut agent) = self.agent.take() {
             agent.display.stop();
         }
+    }
+}
+
+fn tool_result(result: Result<Vec<Value>>) -> Value {
+    match result {
+        Ok(content) => json!({ "content": content }),
+        Err(e) => json!({ "content": [{ "type": "text", "text": format!("Error: {e:#}") }], "isError": true }),
     }
 }
 

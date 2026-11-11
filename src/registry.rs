@@ -31,6 +31,53 @@ pub struct AgentInfo {
     pub last_action_at: Option<u64>,
     /// Screen point the last pointer action targeted.
     pub last_point: Option<(i32, i32)>,
+    /// What the user wants from this agent; set by the viewer, read from its own file.
+    #[serde(skip)]
+    pub control: Control,
+}
+
+/// The user's say over an agent, set from the viewer and obeyed by the agent's MCP server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Control {
+    /// The agent uses its screen.
+    #[default]
+    Run,
+    /// The agent's tool calls are refused until the user resumes it.
+    Stop,
+    /// The agent is stopped and the user drives its screen from the viewer.
+    Takeover,
+    /// The user removed the agent: its screen closes and it leaves the sidebar.
+    Close,
+}
+
+fn control_path(id: &str) -> std::path::PathBuf {
+    paths::agents_dir().join(format!("{id}.control"))
+}
+
+pub fn control(id: &str) -> Control {
+    match std::fs::read_to_string(control_path(id)).as_deref().map(str::trim) {
+        Ok("stop") => Control::Stop,
+        Ok("takeover") => Control::Takeover,
+        Ok("close") => Control::Close,
+        _ => Control::Run,
+    }
+}
+
+pub fn set_control(id: &str, control: Control) -> anyhow::Result<()> {
+    let word = match control {
+        Control::Run => {
+            match std::fs::remove_file(control_path(id)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => return Ok(()),
+            }
+        }
+        Control::Stop => "stop",
+        Control::Takeover => "takeover",
+        Control::Close => "close",
+    };
+    std::fs::create_dir_all(paths::agents_dir())?;
+    std::fs::write(control_path(id), word)?;
+    Ok(())
 }
 
 pub fn now_ms() -> u64 {
@@ -52,11 +99,18 @@ pub fn write(info: &AgentInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Forget an agent entirely: its entry and the user's control over it.
 pub fn remove(id: &str) {
+    unlist(id);
+    let _ = std::fs::remove_file(control_path(id));
+}
+
+/// Take an agent off the list, keeping the user's control over it.
+pub fn unlist(id: &str) {
     let _ = std::fs::remove_file(paths::agents_dir().join(format!("{id}.json")));
 }
 
-/// Live agents, oldest first. Entries left behind by crashed agents are cleaned up.
+/// Live agents the user has not removed, oldest first. Entries left behind by crashed agents are cleaned up.
 pub fn list() -> Vec<AgentInfo> {
     let Ok(entries) = std::fs::read_dir(paths::agents_dir()) else {
         return Vec::new();
@@ -65,13 +119,13 @@ pub fn list() -> Vec<AgentInfo> {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
         .filter_map(|e| {
-            let info: AgentInfo = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
-            if pid_alive(info.pid) {
-                Some(info)
-            } else {
-                let _ = std::fs::remove_file(e.path());
-                None
+            let mut info: AgentInfo = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            if !pid_alive(info.pid) {
+                remove(&info.id);
+                return None;
             }
+            info.control = control(&info.id);
+            (info.control != Control::Close).then_some(info)
         })
         .collect();
     agents.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));

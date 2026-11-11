@@ -19,6 +19,8 @@ cargo build --release
 
 On start, `cua` adds itself to your app launcher (`~/.local/share/applications/cua.desktop`) and registers itself with Claude Code as the `cua` MCP server (run `/mcp` in sessions that were already open). Ask Claude Code to do something on the computer. Each agent shows up on the left; click one to watch its screen live.
 
+To step in, use the toolbar or right-click an agent in the sidebar: **Stop** (Ctrl+.) makes the agent's tool calls fail with a note to wait for you until you **Resume** it; **Take Over** (Ctrl+T) stops it and sends your mouse and keyboard to its screen; the agent's next action waits, and when you **Give Back** (Ctrl+.) it gets the current screen and carries on; **Remove from Sidebar** closes its screen and tells it to stop (if you later ask it to use the computer again, it gets a fresh screen).
+
 Agents act as you: their apps run as your user, with your files, SSH agent, keyring and permissions. Browsers and web apps on an agent's screen start from a fresh copy of your browser profile (Chromium, Chrome, Brave, Edge, Vivaldi, Helium, Firefox, LibreWolf, Zen, Floorp), so they're logged in to the same sites with the same extensions. The copy is refreshed each time the agent opens its browser, and nothing the agent does there writes back to your profile.
 
 ## How it works
