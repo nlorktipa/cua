@@ -27,6 +27,32 @@ fn exe() -> Result<String> {
     Ok(exe.to_string_lossy().into_owned())
 }
 
+const LOGO_SVG: &str = include_str!("../assets/logo.svg");
+
+/// Install the app icon and a desktop entry under `~/.local/share`, so app
+/// launchers list cua and Wayland compositors and bars show its icon (they
+/// look it up through the desktop entry matching the window's app id, `cua`).
+pub fn install_desktop_entry() -> Result<()> {
+    let data = dirs::data_dir().ok_or_else(|| anyhow!("no data directory"))?;
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=cua\nComment=Computer use for Claude Code on per-agent virtual screens\n\
+         Exec=\"{}\"\nIcon=cua\nTerminal=false\nCategories=Utility;Development;\nStartupWMClass=cua\n",
+        exe()?
+    );
+    write_if_changed(&data.join("icons/hicolor/scalable/apps/cua.svg"), LOGO_SVG)?;
+    write_if_changed(&data.join("applications/cua.desktop"), &entry)
+}
+
+fn write_if_changed(path: &std::path::Path, content: &str) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|old| old == content) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+}
+
 fn current_entry() -> Option<Value> {
     let text = std::fs::read_to_string(claude_json()).ok()?;
     let config: Value = serde_json::from_str(&text).ok()?;

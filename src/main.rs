@@ -14,7 +14,7 @@ const USAGE: &str = "cua — computer use for Claude Code on its own virtual scr
 Usage:
   cua           Open the viewer (and register the MCP server with Claude Code)
   cua mcp       Run the MCP server (Claude Code starts this itself)
-  cua setup     Only register the MCP server with Claude Code
+  cua setup     Only register the MCP server with Claude Code and install the app launcher entry
   cua list      List running agents";
 
 fn main() -> anyhow::Result<()> {
@@ -23,6 +23,7 @@ fn main() -> anyhow::Result<()> {
         None | Some("gui") => gui::run(),
         Some("mcp") => mcp::run(),
         Some("setup") => {
+            setup::install_desktop_entry()?;
             match setup::ensure_registered()? {
                 setup::Setup::Ready => println!("cua is already registered with Claude Code."),
                 setup::Setup::Registered => {

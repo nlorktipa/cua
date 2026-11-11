@@ -24,6 +24,9 @@ const CARD_HOVER: Color32 = Color32::from_rgb(40, 40, 49);
 const MUTED: Color32 = Color32::from_rgb(140, 140, 155);
 const TEXT: Color32 = Color32::from_rgb(225, 225, 232);
 
+const ICON_PNG: &[u8] = include_bytes!("../assets/logo-256.png");
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo-64.png");
+
 #[derive(Clone)]
 enum SetupState {
     Working,
@@ -36,6 +39,9 @@ pub fn run() -> anyhow::Result<()> {
     {
         let state = setup_state.clone();
         std::thread::spawn(move || {
+            if let Err(e) = setup::install_desktop_entry() {
+                eprintln!("cua: installing desktop entry failed: {e:#}");
+            }
             let result = match setup::ensure_registered() {
                 Ok(s) => SetupState::Done(s),
                 Err(e) => SetupState::Failed(format!("{e:#}")),
@@ -43,8 +49,12 @@ pub fn run() -> anyhow::Result<()> {
             *state.lock().unwrap() = result;
         });
     }
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title("cua")
             .with_app_id("cua")
             .with_inner_size([1200.0, 780.0])
@@ -59,7 +69,11 @@ pub fn run() -> anyhow::Result<()> {
             visuals.panel_fill = MAIN;
             visuals.window_fill = MAIN;
             cc.egui_ctx.set_visuals(visuals);
-            Ok(Box::new(App::new(setup_state)))
+            let logo = eframe::icon_data::from_png_bytes(LOGO_PNG).ok().map(|icon| {
+                let image = ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+                cc.egui_ctx.load_texture("logo", image, TextureOptions::LINEAR)
+            });
+            Ok(Box::new(App::new(setup_state, logo)))
         }),
     )
     .map_err(|e| anyhow!("{e}"))
@@ -160,11 +174,12 @@ struct App {
     selected: Option<String>,
     slots: HashMap<String, Slot>,
     setup: Arc<Mutex<SetupState>>,
+    logo: Option<TextureHandle>,
 }
 
 impl App {
-    fn new(setup: Arc<Mutex<SetupState>>) -> App {
-        App { agents: Vec::new(), last_scan: None, last_gc: None, selected: None, slots: HashMap::new(), setup }
+    fn new(setup: Arc<Mutex<SetupState>>, logo: Option<TextureHandle>) -> App {
+        App { agents: Vec::new(), last_scan: None, last_gc: None, selected: None, slots: HashMap::new(), setup, logo }
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
@@ -218,8 +233,11 @@ impl App {
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.add_space(4.0);
+            if let Some(logo) = &self.logo {
+                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(28.0)));
+                ui.add_space(2.0);
+            }
             ui.label(egui::RichText::new("cua").size(22.0).strong().color(TEXT));
-            ui.label(egui::RichText::new("agents").size(14.0).color(MUTED));
         });
         ui.add_space(10.0);
 

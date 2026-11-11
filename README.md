@@ -1,4 +1,8 @@
-# cua
+<p align="center">
+  <img src="assets/logo.svg" width="128" height="128" alt="cua logo">
+</p>
+
+<h1 align="center">cua</h1>
 
 Computer use for Claude Code on Linux with Hyprland: every Claude Code session gets its own virtual screen on your computer, with the same apps, files, wallpaper, bar and dock. Agents work in parallel without touching your mouse, your keyboard or each other.
 
@@ -13,7 +17,7 @@ cargo build --release
 ./target/release/cua
 ```
 
-On start, `cua` registers itself with Claude Code as the `cua` MCP server (run `/mcp` in sessions that were already open). Ask Claude Code to do something on the computer. Each agent shows up on the left; click one to watch its screen live.
+On start, `cua` adds itself to your app launcher (`~/.local/share/applications/cua.desktop`) and registers itself with Claude Code as the `cua` MCP server (run `/mcp` in sessions that were already open). Ask Claude Code to do something on the computer. Each agent shows up on the left; click one to watch its screen live.
 
 ## How it works
 
