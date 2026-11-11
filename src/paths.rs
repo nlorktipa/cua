@@ -22,7 +22,7 @@ pub fn agent_dir(id: &str) -> PathBuf {
     runtime_dir().join(id)
 }
 
-/// Browser profiles for agents, kept between sessions. Slot N is used by one
+/// Browser profiles for agents (copies of the user's, see `profiles`). Slot N is used by one
 /// agent at a time, so agents never share a running browser.
 pub fn profile_slot_dir(n: u32) -> PathBuf {
     dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("cua/profiles").join(format!("slot-{n}"))

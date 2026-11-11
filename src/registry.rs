@@ -11,6 +11,9 @@ pub struct AgentInfo {
     pub pid: u32,
     /// Project the agent works in (basename of its working directory).
     pub name: String,
+    /// Short description of what the agent is doing, set via the `set_task` tool.
+    #[serde(default)]
+    pub task: Option<String>,
     pub cwd: String,
     /// MCP client, e.g. "claude-code 2.1.0".
     pub client: String,

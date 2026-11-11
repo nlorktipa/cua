@@ -398,7 +398,8 @@ fn mirror_shell(host_display: &str) -> Vec<Spawn> {
 /// Wrappers placed first on the agent's PATH:
 /// - `uwsm-app`/`uwsm app` normally hand apps to the session's app daemon,
 ///   which would open them on the user's screen. Here they start in place.
-/// - Browsers get cua's own profile; otherwise they would attach to the
+/// - Browsers get their own profile directory, a fresh copy of the user's
+///   (see `profiles`); with the user's own one they would attach to the
 ///   user's running browser and open the window there.
 fn write_shims(dir: &Path, profiles: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -437,30 +438,37 @@ setsid -f "$@" >/dev/null 2>&1 </dev/null
         )?;
     }
 
-    for browser in [
-        "chromium", "google-chrome", "google-chrome-stable", "google-chrome-beta", "brave", "brave-browser",
-        "microsoft-edge", "microsoft-edge-stable", "vivaldi", "vivaldi-stable", "helium-browser",
-    ] {
+    // Each launch first refreshes the agent's copy of the user's profile
+    // (logged in to the same sites), unless that browser is already running.
+    // A rebuilt binary leaves the running one as "<path> (deleted)"; the shims want the path.
+    let cua = std::env::current_exe()?;
+    let cua = PathBuf::from(cua.to_string_lossy().trim_end_matches(" (deleted)"));
+    let sync = |browser: &str, profile: &Path| {
+        format!("'{}' sync-profile '{browser}' '{}' >/dev/null 2>&1\n", cua.display(), profile.display())
+    };
+    for (browser, _) in crate::profiles::CHROMIUM {
         if let Some(real) = which_except(browser, Some(dir)) {
             let profile = profiles.join(browser);
             write(
                 browser,
                 format!(
-                    "case \" $* \" in *\" --user-data-dir\"*) exec '{real}' \"$@\" ;; esac\nexec '{real}' --user-data-dir='{profile}' --no-first-run --no-default-browser-check \"$@\"\n",
+                    "case \" $* \" in *\" --user-data-dir\"*) exec '{real}' \"$@\" ;; esac\n{sync}exec '{real}' --user-data-dir='{profile}' --no-first-run --no-default-browser-check --hide-crash-restore-bubble \"$@\"\n",
                     real = real.display(),
+                    sync = sync(browser, &profile),
                     profile = profile.display()
                 ),
             )?;
         }
     }
-    for browser in ["firefox", "librewolf", "zen-browser", "floorp"] {
+    for (browser, _) in crate::profiles::FIREFOX {
         if let Some(real) = which_except(browser, Some(dir)) {
             let profile = profiles.join(browser);
             write(
                 browser,
                 format!(
-                    "case \" $* \" in *\" --profile \"*|*\" -P \"*) exec '{real}' \"$@\" ;; esac\nmkdir -p '{profile}'\nexec '{real}' --no-remote --profile '{profile}' \"$@\"\n",
+                    "case \" $* \" in *\" --profile \"*|*\" -P \"*) exec '{real}' \"$@\" ;; esac\n{sync}mkdir -p '{profile}'\nexec '{real}' --no-remote --profile '{profile}' \"$@\"\n",
                     real = real.display(),
+                    sync = sync(browser, &profile),
                     profile = profile.display()
                 ),
             )?;

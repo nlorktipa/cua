@@ -24,10 +24,12 @@ and clipboard. Nothing you do here moves the user's cursor or steals their focus
 screens. The user can watch your screen in the cua app.\n\
 Workflow: call `screenshot` to see the screen, act with `click`/`type`/`key`/`scroll`/`drag`, and read the \
 screenshot each action returns. Coordinates are pixels in the screenshot. Start apps with `launch` (shell \
-command), or through the dock/launcher on screen. Browsers started here use cua's own profile (kept between sessions), not the user's, \
-so they start logged out of the user's accounts. Apps that only allow one instance and are already open on the user's screen \
+command), or through the dock/launcher on screen. Apps run as the user, with the user's files and permissions. Browsers (and web apps) start from a fresh copy of the user's \
+browser profile, so they are logged in to the same sites; changes you make there stay in the copy. Apps that only allow one instance and are already open on the user's screen \
 (e.g. some file managers) may open their window there instead; prefer apps that are not running, or pass \
-options for a separate instance.";
+options for a separate instance.\n\
+Call `set_task` first with a short description of what you are doing (shown to the user in the cua app's \
+sidebar), and again whenever your goal changes.";
 
 pub fn run() -> Result<()> {
     let cfg = crate::config::load();
@@ -217,6 +219,13 @@ impl Server {
     }
 
     fn run_tool(&mut self, name: &str, args: &Value) -> Result<Vec<Value>> {
+        if name == "set_task" {
+            let text = args.get("task").and_then(Value::as_str).unwrap_or("").trim();
+            let text: String = text.chars().take(120).collect();
+            self.info.task = (!text.is_empty()).then(|| text.clone());
+            let _ = registry::write(&self.info);
+            return Ok(vec![json!({"type": "text", "text": format!("Task set: {text}")})]);
+        }
         let want_shot = args.get("screenshot").and_then(Value::as_bool).unwrap_or(true);
         let settle = Duration::from_millis(self.cfg.settle_ms);
         let key_delay = Duration::from_millis(self.cfg.key_delay_ms);
@@ -612,6 +621,13 @@ fn tools(cfg: &Config) -> Value {
             "title": "List windows",
             "description": "List the windows on your virtual screen with their titles, app classes, positions and which one has focus.",
             "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": true},
+        },
+        {
+            "name": "set_task",
+            "title": "Set task",
+            "description": "Set a short description (a few words) of what you are working on, shown to the user in the cua app. Call it when you start and whenever your goal changes.",
+            "inputSchema": {"type": "object", "properties": {"task": {"type": "string", "description": "e.g. \"Filling the signup form on example.com\""}}, "required": ["task"]},
             "annotations": {"readOnlyHint": true},
         },
         {

@@ -5,6 +5,7 @@ mod hypr;
 mod keys;
 mod mcp;
 mod paths;
+mod profiles;
 mod registry;
 mod setup;
 mod wl;
@@ -44,6 +45,14 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             Ok(())
+        }
+        // Used by the browser shims on agent screens.
+        Some("sync-profile") => {
+            let mut args = std::env::args().skip(2);
+            match (args.next(), args.next()) {
+                (Some(browser), Some(dest)) => profiles::sync(&browser, std::path::Path::new(&dest)),
+                _ => anyhow::bail!("usage: cua sync-profile <browser> <dir>"),
+            }
         }
         Some("-V" | "--version") => {
             println!("cua {}", env!("CARGO_PKG_VERSION"));

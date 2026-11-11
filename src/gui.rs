@@ -299,17 +299,8 @@ impl App {
         let (color, _) = status(agent);
         p.circle_filled(Pos2::new(text_x + 4.0, y + 9.0), 4.0, color);
         let text_w = rect.max.x - text_x - 12.0;
-        text_elided(p, Pos2::new(text_x + 14.0, y + 1.0), &self.display_name(agent), 14.5, TEXT, text_w - 14.0);
+        text_elided(p, Pos2::new(text_x + 14.0, y + 1.0), &sidebar_label(agent), 14.5, TEXT, text_w - 14.0);
         response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
-    }
-
-    /// Project name, numbered when several agents share a project.
-    fn display_name(&self, agent: &AgentInfo) -> String {
-        let same: Vec<&AgentInfo> = self.agents.iter().filter(|a| a.name == agent.name).collect();
-        match same.iter().position(|a| a.id == agent.id) {
-            Some(i) if same.len() > 1 => format!("{} #{}", agent.name, i + 1),
-            _ => agent.name.clone(),
-        }
     }
 
     /// Draw an agent's latest frame (or a placeholder) into `rect`.
@@ -488,4 +479,13 @@ fn status(agent: &AgentInfo) -> (Color32, &'static str) {
         "starting" => (WARN, "Starting"),
         _ => (BAD, "Failed"),
     }
+}
+
+/// Sidebar card text: the agent's task, else its last action.
+fn sidebar_label(agent: &AgentInfo) -> String {
+    agent
+        .task
+        .clone()
+        .or_else(|| agent.last_action.clone())
+        .unwrap_or_else(|| "No task yet".into())
 }
